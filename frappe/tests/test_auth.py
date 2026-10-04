@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 import requests
 from werkzeug.test import EnvironBuilder
-from werkzeug.wrappers import Request
+from werkzeug.wrappers import Request, Response
 
 import frappe
 from frappe.auth import CookieManager, LoginAttemptTracker, validate_auth, validate_ip_address
@@ -30,6 +30,36 @@ def add_user(email, password, username=None, mobile_no=None):
 	user.simultaneous_sessions = 1
 	user.add_roles("System Manager")
 	frappe.db.commit()
+
+
+class TestCookieManager(UnitTestCase):
+	def test_setting_cookie_supersedes_pending_deletions(self):
+		request = Request.from_values(headers={"Cookie": "sid=fresh"})
+		with patch.object(frappe.local, "request", request, create=True):
+			for deduplicate in (False, True):
+				cookies = CookieManager()
+				cookies.delete_cookie(["sid", "other", "sid"])
+				cookies.set_cookie("sid", "fresh", deduplicate=deduplicate)
+				response = Response()
+				cookies.flush_cookies(response)
+				headers = response.headers.getlist("Set-Cookie")
+				self.assertTrue(any(value.startswith("other=;") for value in headers))
+				sid_headers = [value for value in headers if value.startswith("sid=")]
+				self.assertEqual(len(sid_headers), 0 if deduplicate else 1)
+				if not deduplicate:
+					self.assertTrue(sid_headers[0].startswith("sid=fresh;"))
+
+	def test_deduplicated_cookie_drops_a_different_value_queued_earlier(self):
+		request = Request.from_values(headers={"Cookie": "user_id=jane%40example.com"})
+		with patch.object(frappe.local, "request", request, create=True):
+			cookies = CookieManager()
+			cookies.set_cookie("user_id", "Guest", deduplicate=True)
+			cookies.set_cookie("user_id", "jane@example.com", deduplicate=True)
+			response = Response()
+			cookies.flush_cookies(response)
+			self.assertFalse(
+				[value for value in response.headers.getlist("Set-Cookie") if value.startswith("user_id=")]
+			)
 
 
 class TestAuth(IntegrationTestCase):

@@ -46,6 +46,7 @@
   "login_with_email_link",
   "login_with_email_link_expiry",
   "rate_limit_email_link_login",
+  "login_with_passkey",
   "brute_force_security",
   "allow_consecutive_login_attempts",
   "column_break_34",
@@ -851,12 +852,19 @@
    "fieldtype": "Int",
    "label": "Max Zip Extract Size (MB)",
    "non_negative": 1
+  },
+  {
+   "default": "0",
+   "description": "Allow users to sign in with a passkey (fingerprint, face or screen lock) instead of their password",
+   "fieldname": "login_with_passkey",
+   "fieldtype": "Check",
+   "label": "Login with passkey"
   }
  ],
  "icon": "fa fa-cog",
  "issingle": 1,
  "links": [],
- "modified": "2026-08-06 17:22:18.039321",
+ "modified": "2026-10-03 22:08:06.850654",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "System Settings",

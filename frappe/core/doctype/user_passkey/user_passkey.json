@@ -1,0 +1,145 @@
+{
+ "actions": [],
+ "allow_bulk_edit": 1,
+ "allow_rename": 1,
+ "autoname": "hash",
+ "creation": "2026-10-03 22:07:34.805796",
+ "doctype": "DocType",
+ "editable_grid": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "user",
+  "label",
+  "last_used_at",
+  "column_break_cred",
+  "backup_eligible",
+  "backed_up",
+  "transports",
+  "credential_section",
+  "credential_id",
+  "credential_id_hash",
+  "public_key",
+  "user_handle",
+  "sign_count"
+ ],
+ "fields": [
+  {
+   "fieldname": "user",
+   "fieldtype": "Link",
+   "in_list_view": 1,
+   "in_standard_filter": 1,
+   "label": "User",
+   "options": "User",
+   "read_only": 1,
+   "reqd": 1,
+   "search_index": 1
+  },
+  {
+   "fieldname": "label",
+   "fieldtype": "Data",
+   "in_list_view": 1,
+   "label": "Label",
+   "length": 140,
+   "reqd": 1
+  },
+  {
+   "fieldname": "last_used_at",
+   "fieldtype": "Datetime",
+   "in_list_view": 1,
+   "label": "Last Used At",
+   "read_only": 1
+  },
+  {
+   "fieldname": "column_break_cred",
+   "fieldtype": "Column Break"
+  },
+  {
+   "default": "0",
+   "fieldname": "backup_eligible",
+   "fieldtype": "Check",
+   "label": "Backup Eligible",
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "backed_up",
+   "fieldtype": "Check",
+   "label": "Synced",
+   "read_only": 1
+  },
+  {
+   "fieldname": "transports",
+   "fieldtype": "Data",
+   "label": "Transports",
+   "read_only": 1
+  },
+  {
+   "collapsible": 1,
+   "fieldname": "credential_section",
+   "fieldtype": "Section Break",
+   "label": "Credential"
+  },
+  {
+   "fieldname": "credential_id",
+   "fieldtype": "Long Text",
+   "label": "Credential ID",
+   "read_only": 1
+  },
+  {
+   "fieldname": "credential_id_hash",
+   "fieldtype": "Data",
+   "label": "Credential ID Hash",
+   "length": 64,
+   "read_only": 1,
+   "unique": 1
+  },
+  {
+   "fieldname": "public_key",
+   "fieldtype": "Long Text",
+   "label": "Public Key",
+   "read_only": 1
+  },
+  {
+   "fieldname": "user_handle",
+   "fieldtype": "Data",
+   "label": "User Handle",
+   "length": 64,
+   "read_only": 1
+  },
+  {
+   "default": "0",
+   "fieldname": "sign_count",
+   "fieldtype": "Int",
+   "label": "Sign Count",
+   "length": 20,
+   "read_only": 1
+  }
+ ],
+ "grid_page_length": 50,
+ "links": [],
+ "modified": "2026-10-04 00:09:58.972909",
+ "modified_by": "Administrator",
+ "module": "Core",
+ "name": "User Passkey",
+ "naming_rule": "Random",
+ "owner": "Administrator",
+ "permissions": [
+  {
+   "delete": 1,
+   "read": 1,
+   "report": 1,
+   "role": "System Manager"
+  },
+  {
+   "delete": 1,
+   "read": 1,
+   "role": "All"
+  }
+ ],
+ "row_format": "Dynamic",
+ "rows_threshold_for_grid_search": 20,
+ "sort_field": "creation",
+ "sort_order": "DESC",
+ "states": [],
+ "title_field": "label"
+}

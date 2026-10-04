@@ -1,4 +1,127 @@
 frappe.ui.form.on("User", {
+	render_passkeys(frm) {
+		frm.events.show_passkeys(frm, frm.doc.__onload?.passkeys || []);
+	},
+	async refresh_passkeys(frm) {
+		// Refresh only the list: reloading the form would discard unsaved User edits.
+		const doc = frm.doc;
+		const rows = await frappe.xcall(
+			"frappe.core.doctype.user_passkey.user_passkey.get_passkeys",
+			{ user: doc.name }
+		);
+		if (frm.doc !== doc) return;
+		(doc.__onload ||= {}).passkeys = rows;
+		frm.events.show_passkeys(frm, rows);
+	},
+	show_passkeys(frm, rows) {
+		const is_owner = frm.doc.name === frappe.session.user;
+		const can_remove = is_owner || frappe.model.can_delete("User Passkey");
+		const is_available = !frm.is_new() && can_remove;
+		frm.toggle_display("passkey_section", is_available);
+		if (!is_available) return;
+		const method = "frappe.core.doctype.user_passkey.user_passkey.";
+		const wrapper = $(frm.fields_dict.passkey_list.wrapper).empty();
+		const button = (parent, label, action) =>
+			$('<button type="button" class="es-button">')
+				.text(label)
+				.appendTo(parent)
+				.on("click", action);
+		if (!rows.length) $("<p>").text(__("No passkeys added.")).appendTo(wrapper);
+		for (const row of rows) {
+			const item = $('<div class="flex items-center justify-between gap-3 mb-3">').appendTo(
+				wrapper
+			);
+			const details = $("<div>").appendTo(item);
+			$("<strong>").text(row.label).appendTo(details);
+			if (row.backed_up)
+				$('<span class="es-badge ml-2">').text(__("Synced")).appendTo(details);
+			$("<div>")
+				.text(
+					__("Added on {0}", [frappe.datetime.str_to_user(row.creation.split(" ")[0])])
+				)
+				.appendTo(details);
+			$("<div>")
+				.text(
+					row.last_used_at
+						? __("Last used {0}", [frappe.datetime.prettyDate(row.last_used_at)])
+						: __("Not used yet")
+				)
+				.appendTo(details);
+			const actions = $('<div class="flex gap-2">').appendTo(item);
+			if (is_owner)
+				button(actions, __("Rename"), () => {
+					frappe.prompt(
+						{
+							fieldname: "label",
+							fieldtype: "Data",
+							label: __("Label"),
+							reqd: 1,
+							default: row.label,
+						},
+						async ({ label }) => {
+							await frappe.xcall(method + "rename_passkey", {
+								name: row.name,
+								label,
+							});
+							await frm.events.refresh_passkeys(frm);
+						},
+						__("Rename passkey"),
+						__("Rename")
+					);
+				});
+			button(actions, __("Remove"), () =>
+				frappe.confirm(
+					__("Remove the passkey {0}? You won't be able to sign in with it any more.", [
+						frappe.utils.escape_html(row.label),
+					]),
+					async () => {
+						await frappe.xcall(method + "remove_passkey", { name: row.name });
+						await frm.events.refresh_passkeys(frm);
+					}
+				)
+			);
+		}
+		if (is_owner && frm.doc.__onload?.can_add_passkey && window.PublicKeyCredential) {
+			button(wrapper, __("Add a passkey"), async () => {
+				await frappe.require("passkey.bundle.js");
+				const dialog = new frappe.ui.Dialog({
+					title: __("Add a passkey"),
+					fields: [
+						{
+							fieldname: "password",
+							fieldtype: "Password",
+							label: __("Password"),
+							reqd: 1,
+						},
+						{
+							fieldname: "label",
+							fieldtype: "Data",
+							label: __("Label"),
+							default: __("Passkey"),
+						},
+					],
+					primary_action_label: __("Add a passkey"),
+					async primary_action({ password, label }) {
+						dialog.disable_primary_action();
+						try {
+							await frappe.passkey.register(password, label || __("Passkey"));
+							dialog.hide();
+							await frm.events.refresh_passkeys(frm);
+						} catch (error) {
+							if (error instanceof DOMException)
+								frappe.msgprint(
+									__("Couldn't add this passkey. Please try again.")
+								);
+						} finally {
+							dialog.set_value("password", "");
+							dialog.enable_primary_action();
+						}
+					},
+				});
+				dialog.show();
+			});
+		}
+	},
 	setup: function (frm) {
 		frm.set_query("default_workspace", () => {
 			return {
@@ -100,6 +223,7 @@ frappe.ui.form.on("User", {
 		}
 	},
 	refresh: function (frm) {
+		frm.trigger("render_passkeys");
 		let doc = frm.doc;
 
 		frappe.scroll_to_user_roles_field = function () {

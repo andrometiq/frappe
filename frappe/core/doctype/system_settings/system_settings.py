@@ -76,6 +76,7 @@ class SystemSettings(Document):
 		log_api_requests: DF.Check
 		login_with_email_link: DF.Check
 		login_with_email_link_expiry: DF.Int
+		login_with_passkey: DF.Check
 		logout_on_password_reset: DF.Check
 		max_auto_email_report_per_user: DF.Int
 		max_file_size: DF.Int
@@ -119,7 +120,15 @@ class SystemSettings(Document):
 	# end: auto-generated types
 
 	def validate(self):
+		from frappe.core.doctype.user_passkey.user_passkey import get_relying_party
 		from frappe.twofactor import toggle_two_factor_auth
+
+		if self.login_with_passkey and not get_relying_party():
+			frappe.throw(
+				_("Set host_name in site config to this site's https address, for example {0}").format(
+					"bench --site <site> set-config host_name https://erp.example.com"
+				)
+			)
 
 		enable_password_policy = cint(self.enable_password_policy)
 		minimum_password_score = cint(getattr(self, "minimum_password_score", 0))

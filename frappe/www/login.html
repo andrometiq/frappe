@@ -39,6 +39,8 @@
 		{% endif %}
 	</div>
 </div>
+{% elif login_with_passkey %}
+{{ alert_banner("error") }}
 {% endif %}
 <div class="page-card-actions flex flex-col gap-3">
 	{% if not disable_user_pass_login %}
@@ -48,6 +50,11 @@
 	{% if ldap_settings and ldap_settings.enabled %}
 	<button class="es-button w-full btn-ldap-login" data-variant="solid">
 		{{ _("Login with LDAP") }}</button>
+	{% endif %}
+	{% if login_with_passkey %}
+	<button type="button" class="es-button w-full btn-login-passkey hidden">
+		{{ _("Sign in with a passkey") }}
+	</button>
 	{% endif %}
 	{% if login_with_email_link %}
 	<a href="#login-with-email-link"
@@ -215,6 +222,7 @@
 {% endblock %}
 
 {% block script %}
+{% if login_with_passkey %}{{ include_script("passkey.bundle.js") }}{% endif %}
 <script>{% include "templates/includes/login/login.js" %}</script>
 {% endblock %}
 

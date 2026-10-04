@@ -109,6 +109,7 @@ pdf_generator = [
 # permissions
 
 permission_query_conditions = {
+	"User Passkey": "frappe.core.doctype.user_passkey.user_passkey.get_permission_query_conditions",
 	"Report": [
 		"frappe.core.doctype.report.report.get_permission_query_conditions",
 		"frappe.app_state.get_module_permission_query_conditions",
@@ -160,6 +161,7 @@ permission_query_conditions = {
 }
 
 has_permission = {
+	"User Passkey": "frappe.core.doctype.user_passkey.user_passkey.has_permission",
 	"Report": "frappe.core.doctype.report.report.has_permission",
 	"Event": "frappe.desk.doctype.event.event.has_permission",
 	"ToDo": "frappe.desk.doctype.todo.todo.has_permission",

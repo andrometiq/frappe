@@ -9,6 +9,19 @@ window.login = {};
 window.verify = {};
 
 login.bind_events = function () {
+	if (window.PublicKeyCredential) {
+		$(".btn-login-passkey").removeClass("hidden").on("click", async function () {
+			$(this).prop("disabled", true);
+			try {
+				login.login_handlers[200](await frappe.passkey.authenticate());
+			} catch {
+				login.show_error_banner(__("Couldn't sign you in with this passkey. Use your password instead."));
+			} finally {
+				$(this).prop("disabled", false);
+			}
+		});
+	}
+
 	$(window).on("hashchange", function () {
 		login.route();
 	});

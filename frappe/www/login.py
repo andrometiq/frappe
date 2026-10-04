@@ -108,6 +108,12 @@ def get_context(context):
 
 	context["login_label"] = " / ".join(login_label)
 
+	from frappe.core.doctype.user_passkey.user_passkey import get_relying_party
+
+	context["login_with_passkey"] = bool(
+		frappe.get_system_settings("login_with_passkey") and get_relying_party()
+	)
+
 	context["login_with_email_link"] = frappe.get_system_settings("login_with_email_link")
 
 	return context

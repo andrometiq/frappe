@@ -417,6 +417,7 @@ class CookieManager:
 		max_age=None,
 		deduplicate=False,
 	):
+		self.to_delete = [cookie for cookie in self.to_delete if cookie != key]
 		request = getattr(frappe.local, "request", None)
 		if not secure and request is not None:
 			secure = request.scheme == "https"
@@ -426,6 +427,8 @@ class CookieManager:
 			and request is not None
 			and unquote(request.cookies.get(key, "")) == value
 		):
+			# The browser already holds this value; drop any different value queued earlier in this request.
+			self.cookies.pop(key, None)
 			return
 
 		self.cookies[key] = {
