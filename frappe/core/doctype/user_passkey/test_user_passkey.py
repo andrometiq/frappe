@@ -312,7 +312,13 @@ class TestUserPasskey(PasskeyTestCase):
 			self.verify("login", {})
 
 	def test_state_is_bound_to_session_and_policy(self):
+		from frappe.sessions import hash_sid
+
 		self.register()
+		self.begin("register")
+		# Only the hashed session id is kept at rest, as for core sessions.
+		self.assertEqual(json.loads(self.read_state())["sid"], hash_sid(frappe.session.sid))
+		self.assertNotEqual(hash_sid(frappe.session.sid), frappe.session.sid)
 		for field, value in (("user", self.other), ("sid", "another-session")):
 			options = self.begin("register")
 			credential = SoftAuthenticator().credential(options, origin=ORIGIN, is_registration=True)

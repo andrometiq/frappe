@@ -15,6 +15,7 @@ from frappe import _
 from frappe.auth import get_login_attempt_tracker
 from frappe.model.document import Document
 from frappe.rate_limiter import rate_limit
+from frappe.sessions import hash_sid
 from frappe.twofactor import should_run_2fa
 from frappe.utils import cint, escape_html, format_datetime, now_datetime
 from frappe.utils.password import check_password
@@ -262,7 +263,7 @@ def begin_registration(password: str, otp: str | None = None) -> dict:
 				{"challenge": ""},
 				policy,
 				user=user,
-				sid=frappe.session.sid,
+				sid=hash_sid(frappe.session.sid),
 				method=method,
 				otp_secret=secret,
 				hotp_token=token if method in ("SMS", "Email") else None,
@@ -271,7 +272,7 @@ def begin_registration(password: str, otp: str | None = None) -> dict:
 		state = consume_ceremony_state("register_otp")
 		if (
 			state["user"] != user
-			or state["sid"] != frappe.session.sid
+			or state["sid"] != hash_sid(frappe.session.sid)
 			or state["method"] != twofactor.get_verification_method()
 		):
 			_fail("register")
@@ -288,7 +289,7 @@ def begin_registration(password: str, otp: str | None = None) -> dict:
 		build_registration_options(user, handle, credentials, policy),
 		policy,
 		user=user,
-		sid=frappe.session.sid,
+		sid=hash_sid(frappe.session.sid),
 		user_handle=handle,
 		has_credentials=bool(credentials),
 		two_factor_verified=bool(is_two_factor),
@@ -309,7 +310,7 @@ def verify_registration(credential: str, password: str, label: str | None = None
 
 	user = _registration_user()
 	state = consume_ceremony_state("register")
-	if state["user"] != user or state["sid"] != frappe.session.sid:
+	if state["user"] != user or state["sid"] != hash_sid(frappe.session.sid):
 		_fail("register")
 	if should_run_2fa(user) and not state.get("two_factor_verified"):
 		_fail("register")
