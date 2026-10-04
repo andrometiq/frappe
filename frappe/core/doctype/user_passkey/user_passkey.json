@@ -103,7 +103,7 @@
    "fieldname": "user_handle",
    "fieldtype": "Data",
    "label": "User Handle",
-   "length": 64,
+   "length": 128,
    "read_only": 1
   },
   {
@@ -117,7 +117,7 @@
  ],
  "grid_page_length": 50,
  "links": [],
- "modified": "2026-10-04 00:09:58.972909",
+ "modified": "2026-10-04 01:48:28.849397",
  "modified_by": "Administrator",
  "module": "Core",
  "name": "User Passkey",

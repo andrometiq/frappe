@@ -57,26 +57,66 @@
 		});
 	}
 
+	function signal(method, payload) {
+		// Signal APIs may be absent or never settle; they must not delay account actions.
+		try {
+			if (typeof window.PublicKeyCredential?.[method] === "function") {
+				Promise.resolve(window.PublicKeyCredential[method](payload)).catch(() => {});
+			}
+		} catch {
+			return;
+		}
+	}
+
+	function signal_credentials(data) {
+		if (!data?.rp_id) return;
+		for (const handle of data.handles || []) {
+			const user = { rpId: data.rp_id, userId: handle.user_handle };
+			signal("signalAllAcceptedCredentials", {
+				...user,
+				allAcceptedCredentialIds: handle.credential_ids,
+			});
+			signal("signalCurrentUserDetails", {
+				...user,
+				name: data.name,
+				displayName: data.display_name,
+			});
+		}
+	}
+
 	frappe.passkey = {
-		async register(password, label) {
-			const { message } = await call("begin_registration", { password });
+		signal_credentials,
+		async register(password, label, otp) {
+			const { message } = await call("begin_registration", { password, otp });
+			if (message.two_factor) return { message };
 			const credential = await navigator.credentials.create({
 				publicKey: options_from_json(message, true),
 			});
-			return call("verify_registration", {
+			const result = await call("verify_registration", {
 				credential: JSON.stringify(credential_to_json(credential)),
 				password,
 				label,
 			});
+			return result;
 		},
 		async authenticate() {
 			const { message } = await call("begin_login");
 			const credential = await navigator.credentials.get({
 				publicKey: options_from_json(message, false),
 			});
-			return call("verify_login", {
-				credential: JSON.stringify(credential_to_json(credential)),
-			});
+			try {
+				return await call("verify_login", {
+					credential: JSON.stringify(credential_to_json(credential)),
+				});
+			} catch (error) {
+				if (error?.responseJSON?.exc_type === "UnknownPasskeyError") {
+					signal("signalUnknownCredential", {
+						rpId: message.rpId,
+						credentialId: credential.id,
+					});
+				}
+				throw error;
+			}
 		},
 	};
 })();

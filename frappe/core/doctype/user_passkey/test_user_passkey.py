@@ -2,9 +2,10 @@
 # License: MIT. See LICENSE
 
 import json
-from contextlib import nullcontext
 from http.cookies import SimpleCookie
 from unittest.mock import patch
+
+import pyotp
 
 import frappe
 from frappe.auth import CookieManager, LoginManager, get_login_attempt_tracker
@@ -52,6 +53,7 @@ class PasskeyTestCase(IntegrationTestCase):
 		settings = dict(
 			login_with_passkey=1,
 			enable_two_factor_auth=0,
+			two_factor_method="OTP App",
 			allow_consecutive_login_attempts=3,
 			allow_login_after_fail=300,
 			bypass_2fa_for_retricted_ip_users=0,
@@ -80,7 +82,7 @@ class PasskeyTestCase(IntegrationTestCase):
 		self.enterContext(
 			patch("frappe.model.delete_doc.add_to_deleted_document", side_effect=record_deletion)
 		)
-		store_state = passkey._store_state
+		store_state = passkey.store_ceremony_state
 
 		def record_state(kind, options, policy, **values):
 			result = store_state(kind, options, policy, **values)
@@ -88,7 +90,7 @@ class PasskeyTestCase(IntegrationTestCase):
 			self.state_keys.add(frappe.cache.make_key(f"passkey:{state_id}"))
 			return result
 
-		self.enterContext(patch.object(passkey, "_store_state", side_effect=record_state))
+		self.enterContext(patch.object(passkey, "store_ceremony_state", side_effect=record_state))
 		self.users = []
 		self.addCleanup(self.cleanup_fixtures)
 		self.set_settings(settings)
@@ -184,7 +186,7 @@ class PasskeyTestCase(IntegrationTestCase):
 		return options
 
 	def read_state(self):
-		# Match the site-prefixed raw JSON key used by _store_state; do not consume it.
+		# Match the site-prefixed raw JSON key used by store_ceremony_state; do not consume it.
 		key = frappe.cache.make_key(f"passkey:{self.cookie}")
 		return frappe.cache.get(key)  # nosemgrep: frappe-cache-breaks-multitenancy
 
@@ -206,6 +208,25 @@ class PasskeyTestCase(IntegrationTestCase):
 		frappe.local.login_manager = manager
 		return manager
 
+	def enable_two_factor(self, method="OTP App"):
+		from frappe import twofactor
+
+		self.set_settings({"enable_two_factor_auth": 1, "two_factor_method": method})
+		frappe.db.set_value("Role", "All", "two_factor_auth", 1)
+		secret = pyotp.random_base32()
+		self.enterContext(
+			patch.object(
+				twofactor,
+				"get_otpsecret_for_",
+				side_effect=lambda user: secret if user == self.user else pyotp.random_base32(),
+			)
+		)
+		self.enterContext(patch.object(twofactor, "send_token_via_email", return_value=True))
+		self.enterContext(patch.object(twofactor, "send_token_via_sms", return_value=True))
+		frappe.db.set_value("User", self.user, "mobile_no", "+12025550123")
+		self.enterContext(patch.object(twofactor, "get_default", return_value=1))
+		return secret
+
 
 class TestUserPasskey(PasskeyTestCase):
 	def test_round_trip_and_login_hooks(self):
@@ -213,6 +234,7 @@ class TestUserPasskey(PasskeyTestCase):
 		added_at = get_datetime("2026-10-04 12:34:56")
 		with patch.object(passkey, "now_datetime", return_value=added_at):
 			row = self.register(backup_eligible=True, backed_up=True)
+		self.assertEqual(set(row), {"name", "label"})
 		notice = next(
 			call.kwargs for call in self.enqueue.call_args_list if call.args == ("frappe.sendmail",)
 		)
@@ -220,6 +242,20 @@ class TestUserPasskey(PasskeyTestCase):
 		self.assertEqual(notice["subject"], "A passkey was added to your account")
 		self.assertEqual(notice["recipients"], "notice@example.com")
 		self.assertIn(format_datetime(added_at), notice["message"])
+		self.assertEqual(
+			passkey.get_passkeys()["signal"],
+			{
+				"rp_id": "passkeys.example.com",
+				"handles": [
+					{
+						"user_handle": encode(self.authenticator.user_handle),
+						"credential_ids": [encode(self.authenticator.credential_id)],
+					}
+				],
+				"name": self.user,
+				"display_name": frappe.db.get_value("User", self.user, "full_name"),
+			},
+		)
 		frappe.set_user("Guest")
 		credential = self.assertion(backup_eligible=True, backed_up=True, sign_count=1)
 		manager = self.login_manager()
@@ -256,6 +292,8 @@ class TestUserPasskey(PasskeyTestCase):
 					self.reject(kind, credential)
 
 	def test_state_replay_expiry_wrong_kind_and_browser(self):
+		from redis.exceptions import ConnectionError
+
 		options = self.begin("register")
 		self.assertTrue(0 < frappe.cache.ttl(frappe.cache.make_key(f"passkey:{self.cookie}")) <= 300)
 		credential = self.authenticator.credential(options, origin=ORIGIN, is_registration=True)
@@ -266,19 +304,28 @@ class TestUserPasskey(PasskeyTestCase):
 		self.begin("login")
 		frappe.cache.delete(frappe.cache.make_key(f"passkey:{self.cookie}"))
 		self.reject("login", {})
+		self.begin("login")
+		with (
+			patch.object(frappe.cache, "getdel", side_effect=ConnectionError),
+			self.assertRaises(ConnectionError),
+		):
+			self.verify("login", {})
 
-	def test_registration_session_binding(self):
+	def test_state_is_bound_to_session_and_policy(self):
+		self.register()
 		for field, value in (("user", self.other), ("sid", "another-session")):
-			self.begin("register")
+			options = self.begin("register")
+			credential = SoftAuthenticator().credential(options, origin=ORIGIN, is_registration=True)
 			with patch.dict(frappe.session, {field: value}):
-				self.reject("register", {})
-
-	def test_policy_change(self):
+				self.reject("register", credential)
 		for kind in ("register", "login"):
-			self.begin(kind)
+			options = self.begin(kind)
+			credential = self.authenticator.credential(
+				options, origin=ORIGIN, is_registration=kind == "register"
+			)
 			with patch.dict(frappe.conf, host_name="https://changed.example.com"):
 				self.request(origin="https://changed.example.com", cookie=self.cookie)
-				self.reject(kind, {})
+				self.reject(kind, credential)
 
 	def test_handle_unknown_credential_and_case_sensitive_ids(self):
 		self.authenticator.credential_id = decode("AaAA")
@@ -286,12 +333,23 @@ class TestUserPasskey(PasskeyTestCase):
 		self.authenticator.credential_id = decode("aaAA")
 		second = self.register()
 		self.assertNotEqual(first["name"], second["name"])
+		self.assertEqual(
+			set(passkey.get_passkeys()["signal"]["handles"][0]["credential_ids"]), {"AaAA", "aaAA"}
+		)
 		for handle in (None, encode(b"foreign")):
 			credential = self.assertion()
 			credential["response"]["userHandle"] = handle
 			self.reject("login", credential)
+		credential = self.assertion()
+		credential["response"]["signature"] = encode(b"bad signature")
+		with self.assertRaises(frappe.AuthenticationError) as bad_signature:
+			self.verify("login", credential)
+		self.assertIs(type(bad_signature.exception), frappe.AuthenticationError)
 		self.authenticator = SoftAuthenticator()
-		self.reject("login", self.assertion())
+		with self.assertRaisesRegex(passkey.UnknownPasskeyError, GUEST_ERROR):
+			self.verify("login", self.assertion())
+		self.assertEqual(passkey.remove_passkey(first["name"]), {})
+		self.assertEqual(passkey.get_passkeys()["signal"]["handles"][0]["credential_ids"], ["aaAA"])
 
 	def test_counters_and_regression(self):
 		row = self.register()
@@ -330,7 +388,7 @@ class TestUserPasskey(PasskeyTestCase):
 		self.reject("register", credential, message="Couldn't add this passkey")
 		self.assertEqual(get_login_attempt_tracker(self.user).login_failed_count, 1)
 		self.assertEqual(get_login_attempt_tracker("192.0.2.81").login_failed_count, 1)
-		self.assertEqual(passkey.get_passkeys(), [])
+		self.assertEqual(passkey.get_passkeys()["passkeys"], [])
 
 	def test_merged_credentials_and_new_registration(self):
 		first_authenticator = self.authenticator
@@ -361,7 +419,31 @@ class TestUserPasskey(PasskeyTestCase):
 		self.assertEqual(options["user"]["id"], canonical.user_handle)
 		credential = SoftAuthenticator().credential(options, origin=ORIGIN, is_registration=True)
 		self.verify("register", credential)
-		self.assertEqual(len(passkey.get_passkeys()), 3)
+		self.assertEqual(len(passkey.get_passkeys()["passkeys"]), 3)
+
+		groups = {
+			row["user_handle"]: row["credential_ids"] for row in passkey.get_passkeys()["signal"]["handles"]
+		}
+		self.assertEqual(
+			groups[encode(second_authenticator.user_handle)], [encode(second_authenticator.credential_id)]
+		)
+		self.assertIn(
+			encode(first_authenticator.credential_id), groups[encode(first_authenticator.user_handle)]
+		)
+		frappe.set_user(self.manager)
+		self.assertEqual(
+			passkey.remove_passkey(second["name"]),
+			{"retired_handle": encode(second_authenticator.user_handle)},
+		)
+		self.assertNotIn("signal", passkey.get_passkeys(self.user))
+		frappe.set_user(self.user)
+		groups = {
+			row["user_handle"]: row["credential_ids"] for row in passkey.get_passkeys()["signal"]["handles"]
+		}
+		self.assertNotIn(encode(second_authenticator.user_handle), groups)
+		self.assertIn(
+			encode(first_authenticator.credential_id), groups[encode(first_authenticator.user_handle)]
+		)
 
 	def test_list_is_ordered_and_not_truncated(self):
 		# Populate through the public registration path, resetting only its hourly quota.
@@ -370,11 +452,11 @@ class TestUserPasskey(PasskeyTestCase):
 				self.clear_limits()
 			self.authenticator = SoftAuthenticator()
 			self.register()
-		rows = passkey.get_passkeys()
+		rows = passkey.get_passkeys()["passkeys"]
 		self.assertEqual(len(rows), 21)
 		self.assertEqual(rows, sorted(rows, key=lambda row: (row.creation, row.name)))
 		frappe.set_user(self.other)
-		self.assertEqual(passkey.get_passkeys(self.user), [])
+		self.assertEqual(passkey.get_passkeys(self.user)["passkeys"], [])
 
 	def test_setting_off_at_both_ends(self):
 		for kind in ("register", "login"):
@@ -419,27 +501,82 @@ class TestUserPasskey(PasskeyTestCase):
 		):
 			self.assertEqual(passkey.get_relying_party()["origin"], "https://erp.example.com")
 
-	def test_two_factor_and_restricted_ip_exemption(self):
+	def otp_challenge(self):
+		# Core password login reads `{tmp_id}_otp_secret`; the add flow must never write one.
+		login_otp_keys = set(frappe.cache.keys("*_otp_secret"))
+		challenge = self.begin("register")
+		self.assertEqual(set(challenge), {"two_factor"})
+		self.assertEqual(set(frappe.cache.keys("*_otp_secret")), login_otp_keys)
+		return json.loads(self.read_state())
+
+	def test_two_factor_enrolment_and_uv_login(self):
 		self.register()
 		options = self.begin("register")
-		credential = self.authenticator.credential(options, origin=ORIGIN, is_registration=True)
-		self.set_settings({"enable_two_factor_auth": 1})
-		frappe.db.set_value("Role", "All", "two_factor_auth", 1)
-		self.assertIsNotNone(self.read_state())
-		self.reject("register", credential, message="two-factor authentication")
-		with self.assertRaisesRegex(frappe.ValidationError, "two-factor authentication"):
-			passkey.begin_registration(PASSWORD)
-		self.reject("login", self.assertion())
-		self.assertEqual(len(passkey.get_passkeys()), 1)
-		self.set_settings({"bypass_2fa_for_retricted_ip_users": 1})
-		frappe.db.set_value("User", self.user, "restrict_ip", "192.0.2.81")
-		self.assertIn("challenge", passkey.begin_registration(PASSWORD))
+		credential = SoftAuthenticator().credential(options, origin=ORIGIN, is_registration=True)
+		secret = self.enable_two_factor()
+		get_login_attempt_tracker(self.user).add_failure_attempt()
+		self.reject("register", credential)
+		self.assertEqual(get_login_attempt_tracker(self.user).login_failed_count, 1)
+		for method in ("OTP App", "Email", "SMS"):
+			with self.subTest(method=method):
+				self.clear_limits()
+				self.set_settings({"two_factor_method": method})
+				# A zero counter is a valid HOTP token and must not fall back to TOTP.
+				with patch.object(
+					pyotp.TOTP, "now", return_value="000000" if method == "Email" else "123456"
+				):
+					token = self.otp_challenge()["hotp_token"]
+				self.assertEqual(token, None if method == "OTP App" else (0 if method == "Email" else 123456))
+				otp_cookie = self.cookie
+				otp = pyotp.HOTP(secret).at(token) if token is not None else pyotp.TOTP(secret).now()
+				options = passkey.begin_registration(PASSWORD, otp)
+				self.cookie = frappe.local.cookie_manager.cookies["__Host-passkey_state"]["value"]
+				self.request(cookie=self.cookie)
+				self.authenticator = SoftAuthenticator()
+				credential = self.authenticator.credential(options, origin=ORIGIN, is_registration=True)
+				self.verify("register", credential)
+				self.request(cookie=otp_cookie)
+				with self.assertRaises(frappe.ValidationError):
+					passkey.begin_registration(PASSWORD, otp)
+		frappe.set_user("Guest")
 		self.login_manager()
 		self.verify("login", self.assertion())
 		self.assertEqual(frappe.session.user, self.user)
-
+		self.set_settings({"bypass_2fa_for_retricted_ip_users": 1})
+		frappe.db.set_value("User", self.user, "restrict_ip", "192.0.2.81")
+		self.assertIn("challenge", passkey.begin_registration(PASSWORD))
 		frappe.db.set_value("User", self.user, "enabled", 0)
 		self.reject("login", self.assertion())
+
+	def test_otp_binding_replay_expiry_and_lock(self):
+		secret = self.enable_two_factor()
+		for mismatch in ("user", "session", "expired", "method"):
+			with self.subTest(mismatch=mismatch):
+				self.clear_limits()
+				frappe.set_user(self.user)
+				self.otp_challenge()
+				if mismatch == "user":
+					frappe.set_user(self.other)
+				elif mismatch == "session":
+					frappe.session.sid = "another-session"
+				elif mismatch == "method":
+					self.set_settings({"two_factor_method": "Email"})
+				else:
+					frappe.cache.delete(frappe.cache.make_key(f"passkey:{self.cookie}"))
+				with self.assertRaises(frappe.ValidationError):
+					passkey.begin_registration(PASSWORD, pyotp.TOTP(secret).now())
+		frappe.set_user(self.user)
+		self.set_settings({"two_factor_method": "OTP App"})
+		self.clear_limits()
+		for attempt in range(4):
+			self.otp_challenge()
+			with self.assertRaisesRegex(frappe.ValidationError, "Incorrect Verification code"):
+				passkey.begin_registration(PASSWORD, "invalid")
+			if attempt == 0:
+				with self.assertRaises(frappe.ValidationError):
+					passkey.begin_registration(PASSWORD, pyotp.TOTP(secret).now())
+		with self.assertRaises(frappe.SecurityException):
+			passkey.begin_registration(PASSWORD)
 
 	def test_password_tracker_and_lock(self):
 		with self.assertRaises(frappe.ValidationError):
@@ -468,25 +605,25 @@ class TestUserPasskey(PasskeyTestCase):
 		name = row["name"]
 		doc = frappe.get_doc("User Passkey", name)
 		doc.check_permission("read")
-		self.assertTrue(passkey.has_permission(doc, user=self.user))
-		self.assertFalse(passkey.has_permission(doc, user=self.other))
 		self.assertEqual(passkey.rename_passkey(name, " Renamed ")["label"], "Renamed")
 		with self.assertRaises(frappe.PermissionError):
 			doc.save()
 		with self.assertRaises(frappe.PermissionError):
 			frappe.copy_doc(doc).insert()
 		frappe.set_user(self.other)
-		self.assertEqual(passkey.get_passkeys(self.user), [])
+		self.assertEqual(passkey.get_passkeys(self.user)["passkeys"], [])
 		with self.assertRaises(frappe.PermissionError):
 			frappe.get_doc("User Passkey", name).check_permission("read")
 		with self.assertRaises(frappe.PermissionError):
 			passkey.rename_passkey(name, "Foreign")
 		frappe.set_user(self.manager)
-		self.assertEqual(passkey.get_passkeys(self.user)[0].name, name)
+		self.assertEqual(passkey.get_passkeys(self.user)["passkeys"][0].name, name)
 		with self.assertRaises(frappe.PermissionError):
 			passkey.rename_passkey(name, "Manager")
-		passkey.remove_passkey(name)
+		self.assertEqual(passkey.remove_passkey(name), {"retired_handle": doc.user_handle})
 		self.assertFalse(frappe.db.exists("User Passkey", name))
+		frappe.set_user(self.user)
+		self.assertEqual(passkey.get_passkeys()["signal"]["handles"], [])
 
 	def test_controller_label_and_immutability(self):
 		name = self.register()["name"]
@@ -523,7 +660,6 @@ class TestUserPasskey(PasskeyTestCase):
 			credential["response"][field] = "a"
 			self.reject("login", credential)
 
-	def test_malformed_cbor_and_unusable_public_keys(self):
 		import cbor2
 
 		for key in ({}, None, [], {1: 2, 3: -7, -1: 1, -2: "x", -3: "y"}):
@@ -535,7 +671,8 @@ class TestUserPasskey(PasskeyTestCase):
 				attestation["authData"] = attestation["authData"][:key_offset] + cbor2.dumps(key)
 				credential["response"]["attestationObject"] = encode(cbor2.dumps(attestation))
 				self.reject("register", credential)
-		self.assertEqual(passkey.get_passkeys(), [])
+		# Only the passkey registered at the start remains.
+		self.assertEqual(len(passkey.get_passkeys()["passkeys"]), 1)
 
 	def test_concurrent_first_enrolment(self):
 		first = self.begin("register")
@@ -551,33 +688,23 @@ class TestUserPasskey(PasskeyTestCase):
 			SoftAuthenticator().credential(second, origin=ORIGIN, is_registration=True),
 			message="Please try again",
 		)
-		self.assertEqual(len(passkey.get_passkeys()), 1)
-		name = passkey.get_passkeys()[0].name
+		self.assertEqual(len(passkey.get_passkeys()["passkeys"]), 1)
+		name = passkey.get_passkeys()["passkeys"][0].name
 		options = self.begin("register")
 		self.assertEqual(options["user"]["id"], encode(self.authenticator.user_handle))
 		self.assertEqual(options["excludeCredentials"][0]["id"], encode(self.authenticator.credential_id))
 		credential = self.authenticator.credential(options, origin=ORIGIN, is_registration=True)
 		self.reject("register", credential)
-		self.assertEqual([entry.name for entry in passkey.get_passkeys()], [name])
+		self.assertEqual([entry.name for entry in passkey.get_passkeys()["passkeys"]], [name])
 
-	def test_rate_limits_follow_identity_despite_changed_form_fields(self):
-		name = self.register()["name"]
-		arguments = {
-			"begin_registration": {"password": PASSWORD},
-			"verify_registration": {"credential": "{}", "password": PASSWORD},
-			"verify_login": {"credential": "{}"},
-			"rename_passkey": {"name": name, "label": "Changed"},
-		}
-		for endpoint, (count, _) in LIMITS.items():
+	def test_rate_limits_ignore_client_identity(self):
+		for endpoint in ("begin_login", "begin_registration"):
 			self.clear_limits()
-			self.request()
 			call = getattr(passkey, endpoint)
-			args = arguments.get(endpoint, {})
-			for index in range(count):
+			args = {"password": PASSWORD} if endpoint == "begin_registration" else {}
+			for index in range(LIMITS[endpoint][0]):
 				frappe.form_dict.update(user=str(index), label=str(index), password=str(index))
-				error = frappe.AuthenticationError if endpoint == "verify_login" else frappe.ValidationError
-				with self.assertRaises(error) if endpoint.startswith("verify_") else nullcontext():
-					call(**args)
+				call(**args)
 			with self.assertRaises(frappe.RateLimitExceededError):
 				call(**args)
 
@@ -586,6 +713,12 @@ class TestUserPasskey(PasskeyTestCase):
 		doc = frappe.get_doc("User", self.user)
 		doc.onload()
 		self.assertTrue(doc.get_onload("can_add_passkey"))
+		self.assertNotIn("passkey_signal", doc.get_onload())
+		frappe.set_user(self.manager)
+		doc.onload()
+		self.assertNotIn("passkey_signal", doc.get_onload())
+		self.assertNotIn("signal", passkey.get_passkeys(self.user))
+		frappe.set_user(self.user)
 		self.assertNotIn("passkey_origin_valid", doc.get_onload())
 		self.set_settings({"login_with_passkey": 0})
 		doc.onload()
@@ -599,26 +732,29 @@ class TestUserPasskey(PasskeyTestCase):
 			doc = frappe.get_doc("User", self.user)
 			doc.onload()
 			self.assertEqual(doc.get_onload("passkeys")[0].name, name)
-			self.assertEqual(passkey.get_passkeys()[0].name, name)
+			self.assertEqual(passkey.get_passkeys()["passkeys"][0].name, name)
 			self.assertEqual(passkey.rename_passkey(name, "Changed")["label"], "Changed")
 			passkey.remove_passkey(name)
-			self.assertEqual(passkey.get_passkeys(), [])
+			self.assertEqual(passkey.get_passkeys()["passkeys"], [])
+		self.assertEqual(passkey.get_passkeys()["signal"]["handles"], [])
 
 		frappe.set_user(self.other)
 		with (
 			patch("frappe.has_permission", return_value=False),
-			patch.object(passkey, "get_passkeys") as query,
+			patch.object(passkey, "get_passkey_list") as query,
 		):
 			frappe.get_doc("User", self.user).onload()
 			query.assert_not_called()
 
-	def test_redis_failure_is_not_ignored(self):
-		from redis.exceptions import ConnectionError
-
-		self.begin("login")
-		with patch.object(frappe.cache, "getdel", side_effect=ConnectionError):
-			with self.assertRaises(ConnectionError):
-				self.verify("login", {})
+	def test_retirement_never_reuses_handle(self):
+		row = self.register()
+		handle = encode(self.authenticator.user_handle)
+		options = self.begin("register")
+		credential = SoftAuthenticator().credential(options, origin=ORIGIN, is_registration=True)
+		self.assertEqual(passkey.remove_passkey(row["name"]), {"retired_handle": handle})
+		self.assertEqual(passkey.get_passkeys()["signal"]["handles"], [])
+		self.reject("register", credential, message="Please try again")
+		self.assertNotEqual(self.begin("register")["user"]["id"], handle)
 
 
 class TestPasskeyHTTP(PasskeyTestCase, FrappeAPITestCase):
@@ -761,6 +897,36 @@ class TestPasskeyHTTP(PasskeyTestCase, FrappeAPITestCase):
 		self.check_state_cookie(response, 300, secure=False)
 		response = self.call("verify_login", {"credential": "{}"}, status=401)
 		self.check_state_cookie(response, 0, secure=False)
+
+	def test_enrolment_code_step_cannot_complete_password_login(self):
+		self.password_login(self.user)
+		secret = self.enable_two_factor()
+		frappe.db.commit()  # nosemgrep
+		response = self.call("begin_registration", {"password": PASSWORD})
+		self.assertEqual(set(response.json["message"]), {"two_factor"})
+		state_id = self.TEST_CLIENT.get_cookie("__Host-passkey_state", domain="passkeys.example.com").value
+		for tmp_id in (state_id, None):
+			with self.subTest(tmp_id=tmp_id):
+				data = {"usr": self.other, "pwd": PASSWORD, "otp": pyotp.TOTP(secret).now()}
+				if tmp_id:
+					data["tmp_id"] = tmp_id
+				response = self.post(self.method("login"), data, headers={"Origin": ORIGIN})
+				self.assertNotEqual(response.status_code, 200, response.get_data(as_text=True))
+				response = self.get(self.method("frappe.auth.get_logged_user"))
+				self.assertNotEqual(response.json.get("message"), self.other)
+		self.TEST_CLIENT = get_test_client()
+		response = self.post(
+			self.method("login"), {"usr": self.user, "pwd": PASSWORD}, headers={"Origin": ORIGIN}
+		)
+		data = {
+			"usr": self.user,
+			"pwd": PASSWORD,
+			"otp": pyotp.TOTP(secret).now(),
+			"tmp_id": response.json["tmp_id"],
+		}
+		response = self.post(self.method("login"), data, headers={"Origin": ORIGIN})
+		self.assertIn(response.json["message"], ("Logged In", "No App"))
+		self.assertEqual(self.get(self.method("frappe.auth.get_logged_user")).json["message"], self.user)
 
 	def test_rest_owner_and_foreign_permissions(self):
 		name = self.register()

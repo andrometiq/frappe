@@ -11,6 +11,37 @@ from frappe.utils import add_to_date, now
 UI_TEST_USER = "frappe@example.com"
 
 
+@whitelist_for_tests(methods=["POST"])
+def seed_user_passkey(label: str) -> dict:
+	import base64
+	import hashlib
+	import secrets
+
+	user = frappe.session.user
+	if user == "Guest":
+		raise frappe.PermissionError
+	credential_id = secrets.token_bytes(32)
+	handle = frappe.db.get_value(
+		"User Passkey", {"user": user}, "user_handle", order_by="creation asc, name asc"
+	)
+	doc = frappe.get_doc(
+		doctype="User Passkey",
+		user=user,
+		label=label,
+		credential_id=base64.urlsafe_b64encode(credential_id).rstrip(b"=").decode(),
+		credential_id_hash=hashlib.sha256(credential_id).hexdigest(),
+		public_key=base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode(),
+		user_handle=handle or base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode(),
+		sign_count=0,
+	).insert(ignore_permissions=True)
+	return {
+		"name": doc.name,
+		"label": doc.label,
+		"credential_id": doc.credential_id,
+		"user_handle": doc.user_handle,
+	}
+
+
 @whitelist_for_tests()
 def create_if_not_exists(doc: Any):
 	"""Create records if they dont exist.

@@ -8,6 +8,8 @@ import secrets
 from ipaddress import ip_address
 from urllib.parse import urlsplit
 
+import pyotp
+
 import frappe
 from frappe import _
 from frappe.auth import get_login_attempt_tracker
@@ -16,6 +18,10 @@ from frappe.rate_limiter import rate_limit
 from frappe.twofactor import should_run_2fa
 from frappe.utils import cint, escape_html, format_datetime, now_datetime
 from frappe.utils.password import check_password
+
+
+class UnknownPasskeyError(frappe.AuthenticationError):
+	pass
 
 
 class UserPasskey(Document):
@@ -99,13 +105,15 @@ def get_relying_party():
 	return {"origin": f"{url.scheme}://{authority}", "rp_id": host}
 
 
-def _fail(kind):
+def _fail(kind, exception=None):
 	message = (
 		_("Couldn't sign you in with this passkey. Use your password instead.")
 		if kind == "login"
 		else _("Couldn't add this passkey. Please try again.")
 	)
-	frappe.throw(message, frappe.AuthenticationError if kind == "login" else frappe.ValidationError)
+	frappe.throw(
+		message, exception or (frappe.AuthenticationError if kind == "login" else frappe.ValidationError)
+	)
 
 
 def _policy(kind):
@@ -121,12 +129,10 @@ def _registration_user():
 	user = frappe.session.user
 	if user == "Guest" or frappe.session.data.get("impersonated_by"):
 		_fail("register")
-	if should_run_2fa(user):
-		frappe.throw(_("Passkeys can't be added while two-factor authentication applies to your account"))
 	return user
 
 
-def _check_password(user, password):
+def _check_password(user, password, reset=True):
 	trackers = [get_login_attempt_tracker(user), get_login_attempt_tracker(frappe.local.request_ip)]
 	try:
 		check_password(user, password, delete_tracker_cache=False)
@@ -134,8 +140,9 @@ def _check_password(user, password):
 		for tracker in trackers:
 			tracker.add_failure_attempt()
 		_fail("register")
-	for tracker in trackers:
-		tracker.add_success_attempt()
+	if reset:
+		for tracker in trackers:
+			tracker.add_success_attempt()
 
 
 def _cookie_name(policy):
@@ -154,7 +161,7 @@ def _set_cookie(value, max_age, policy):
 	)
 
 
-def _store_state(kind, options, policy, **values):
+def store_ceremony_state(kind, options, policy, **values):
 	state_id = frappe.generate_hash(length=32)
 	state = {"kind": kind, "challenge": options["challenge"], **policy, **values}
 	# make_key scopes raw JSON to this site; GETDEL must consume it atomically.
@@ -165,7 +172,7 @@ def _store_state(kind, options, policy, **values):
 	return options
 
 
-def _consume_state(kind):
+def consume_ceremony_state(kind):
 	policy = _policy(kind)
 	state_id = frappe.request.cookies.get(_cookie_name(policy))
 	_set_cookie("", 0, policy)
@@ -208,9 +215,7 @@ def _parse(credential, kind):
 	return parsed
 
 
-@frappe.whitelist(methods=["POST"])
-@rate_limit(limit=10, seconds=3600, user_based=True)
-def begin_registration(password: str) -> dict:
+def build_registration_options(user, handle, credentials, policy):
 	from webauthn import generate_registration_options, options_to_json
 	from webauthn.helpers import base64url_to_bytes
 	from webauthn.helpers.structs import (
@@ -220,15 +225,6 @@ def begin_registration(password: str) -> dict:
 		UserVerificationRequirement,
 	)
 
-	policy = _policy("register")
-	user = _registration_user()
-	_check_password(user, password)
-	credentials = _credentials(user)
-	handle = (
-		credentials[0].user_handle
-		if credentials
-		else base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
-	)
 	options = generate_registration_options(
 		rp_id=policy["rp_id"],
 		rp_name=frappe.get_system_settings("app_name") or _("Frappe"),
@@ -242,13 +238,60 @@ def begin_registration(password: str) -> dict:
 			PublicKeyCredentialDescriptor(id=base64url_to_bytes(row.credential_id)) for row in credentials
 		],
 	)
-	return _store_state(
+	return json.loads(options_to_json(options))
+
+
+@frappe.whitelist(methods=["POST"])
+@rate_limit(limit=10, seconds=3600, user_based=True)
+def begin_registration(password: str, otp: str | None = None) -> dict:
+	policy = _policy("register")
+	user = _registration_user()
+	is_two_factor = should_run_2fa(user)
+	# A correct password must not reset failures for an unverified second factor.
+	_check_password(user, password, reset=not is_two_factor)
+	if is_two_factor:
+		from frappe import twofactor
+
+		if not otp:
+			secret = twofactor.get_otpsecret_for_(user)
+			token = int(pyotp.TOTP(secret).now())
+			method = twofactor.get_verification_method()
+			# The code step lives only in this single-use state, never in the password-login OTP cache.
+			store_ceremony_state(
+				"register_otp",
+				{"challenge": ""},
+				policy,
+				user=user,
+				sid=frappe.session.sid,
+				method=method,
+				otp_secret=secret,
+				hotp_token=token if method in ("SMS", "Email") else None,
+			)
+			return {"two_factor": twofactor.get_verification_obj(user, token, secret)}
+		state = consume_ceremony_state("register_otp")
+		if (
+			state["user"] != user
+			or state["sid"] != frappe.session.sid
+			or state["method"] != twofactor.get_verification_method()
+		):
+			_fail("register")
+		if not twofactor.verify_otp_token(user, otp, state["otp_secret"], state["hotp_token"]):
+			frappe.throw(_("Incorrect Verification code"))
+	credentials = _credentials(user)
+	handle = (
+		credentials[0].user_handle
+		if credentials
+		else base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+	)
+	return store_ceremony_state(
 		"register",
-		json.loads(options_to_json(options)),
+		build_registration_options(user, handle, credentials, policy),
 		policy,
 		user=user,
 		sid=frappe.session.sid,
 		user_handle=handle,
+		has_credentials=bool(credentials),
+		two_factor_verified=bool(is_two_factor),
 	)
 
 
@@ -265,12 +308,17 @@ def verify_registration(credential: str, password: str, label: str | None = None
 	from webauthn.helpers.exceptions import WebAuthnException
 
 	user = _registration_user()
-	state = _consume_state("register")
+	state = consume_ceremony_state("register")
 	if state["user"] != user or state["sid"] != frappe.session.sid:
+		_fail("register")
+	if should_run_2fa(user) and not state.get("two_factor_verified"):
 		_fail("register")
 	_check_password(user, password)
 	credentials = _credentials(user)
-	if credentials and credentials[0].user_handle != state["user_handle"]:
+	# A pending enrolment must not resurrect a handle signalled as retired.
+	if (not credentials and state["has_credentials"]) or (
+		credentials and credentials[0].user_handle != state["user_handle"]
+	):
 		frappe.throw(_("Please try again"))
 	try:
 		parsed = _parse(credential, "register")
@@ -324,17 +372,24 @@ def verify_registration(credential: str, password: str, label: str | None = None
 	return {"name": doc.name, "label": doc.label}
 
 
-@frappe.whitelist(allow_guest=True, methods=["POST"])
-@rate_limit(limit=30, seconds=60)
-def begin_login():
+def build_login_options(policy):
 	from webauthn import generate_authentication_options, options_to_json
 	from webauthn.helpers.structs import UserVerificationRequirement
 
-	policy = _policy("login")
-	options = generate_authentication_options(
-		rp_id=policy["rp_id"], user_verification=UserVerificationRequirement.REQUIRED
+	return json.loads(
+		options_to_json(
+			generate_authentication_options(
+				rp_id=policy["rp_id"], user_verification=UserVerificationRequirement.REQUIRED
+			)
+		)
 	)
-	return _store_state("login", json.loads(options_to_json(options)), policy)
+
+
+@frappe.whitelist(allow_guest=True, methods=["POST"])
+@rate_limit(limit=30, seconds=60)
+def begin_login():
+	policy = _policy("login")
+	return store_ceremony_state("login", build_login_options(policy), policy)
 
 
 @frappe.whitelist(allow_guest=True, methods=["POST"])
@@ -344,7 +399,7 @@ def verify_login(credential: str) -> None:
 	from webauthn.helpers import base64url_to_bytes, bytes_to_base64url
 	from webauthn.helpers.exceptions import WebAuthnException
 
-	state = _consume_state("login")
+	state = consume_ceremony_state("login")
 	try:
 		parsed = _parse(credential, "login")
 	except (WebAuthnException, ValueError, TypeError, KeyError, IndexError):
@@ -352,7 +407,7 @@ def verify_login(credential: str) -> None:
 	digest = hashlib.sha256(parsed.raw_id).hexdigest()
 	name = frappe.db.get_value("User Passkey", {"credential_id_hash": digest})
 	if not name:
-		_fail("login")
+		_fail("login", UnknownPasskeyError)
 	try:
 		doc = frappe.get_doc("User Passkey", name, for_update=True)
 	except frappe.DoesNotExistError:
@@ -379,7 +434,7 @@ def verify_login(credential: str) -> None:
 		result.credential_device_type.value == "multi_device"
 	):
 		_fail("login")
-	if not frappe.db.get_value("User", doc.user, "enabled") or should_run_2fa(doc.user):
+	if not frappe.db.get_value("User", doc.user, "enabled"):
 		_fail("login")
 	# Only server-verified counters and backup state are written to the locked row.
 	doc.db_set(
@@ -407,16 +462,52 @@ def rename_passkey(name: str, label: str) -> dict:
 
 
 @frappe.whitelist(methods=["POST"])
-def remove_passkey(name: str) -> None:
+def remove_passkey(name: str) -> dict:
+	doc = frappe.get_doc("User Passkey", name)
+	doc.check_permission("delete")
+	_credentials(doc.user)
 	frappe.delete_doc("User Passkey", name)
+	if not frappe.db.exists("User Passkey", {"user": doc.user, "user_handle": doc.user_handle}):
+		return {"retired_handle": doc.user_handle}
+	return {}
 
 
 @frappe.whitelist(methods=["POST"])
-def get_passkeys(user: str | None = None) -> list:
+def get_passkeys(user: str | None = None) -> dict:
+	user = user or frappe.session.user
+	result = {"passkeys": get_passkey_list(user)}
+	if user == frappe.session.user:
+		result["signal"] = _get_signal_data()
+	return result
+
+
+def get_passkey_list(user: str) -> list:
 	return frappe.get_list(
 		"User Passkey",
-		filters={"user": user or frappe.session.user},
+		filters={"user": user},
 		fields=["name", "label", "creation", "last_used_at", "backed_up"],
 		order_by="creation asc, name asc",
 		limit=0,
 	)
+
+
+def _get_signal_data():
+	policy = get_relying_party()
+	if not policy:
+		return None
+	user = frappe.session.user
+	rows = frappe.get_all(
+		"User Passkey",
+		filters={"user": user},
+		fields=["credential_id", "user_handle"],
+		order_by="creation asc, name asc",
+	)
+	handles = {}
+	for row in rows:
+		handles.setdefault(row.user_handle, []).append(row.credential_id)
+	return {
+		"rp_id": policy["rp_id"],
+		"name": user,
+		"display_name": frappe.db.get_value("User", user, "full_name") or user,
+		"handles": [{"user_handle": handle, "credential_ids": ids} for handle, ids in handles.items()],
+	}

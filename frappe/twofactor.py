@@ -145,8 +145,6 @@ def get_verification_method():
 
 def confirm_otp_token(login_manager, otp=None, tmp_id=None):
 	"""Confirm otp matches."""
-	from frappe.auth import get_login_attempt_tracker
-
 	if not otp:
 		otp = frappe.form_dict.get("otp")
 	if not otp:
@@ -160,29 +158,39 @@ def confirm_otp_token(login_manager, otp=None, tmp_id=None):
 	if not otp_secret:
 		raise ExpiredLoginException(_("Login session expired, refresh page to retry"))
 
-	tracker = get_login_attempt_tracker(login_manager.user)
+	if verify_otp_token(login_manager.user, otp, otp_secret, hotp_token):
+		if hotp_token:
+			frappe.cache.delete(tmp_id + "_token")
+		return True
+	login_manager.fail(_("Incorrect Verification code"), login_manager.user)
+
+
+def verify_otp_token(user, otp, otp_secret, hotp_token=None):
+	"""Check `otp` against the HOTP token when one was issued, else against the TOTP secret."""
+	from frappe.auth import get_login_attempt_tracker
+
+	tracker = get_login_attempt_tracker(user)
 
 	hotp = pyotp.HOTP(otp_secret)
-	if hotp_token:
+	if hotp_token is not None:
 		if hotp.verify(otp, int(hotp_token)):
-			frappe.cache.delete(tmp_id + "_token")
 			tracker.add_success_attempt()
 			return True
 		else:
 			tracker.add_failure_attempt()
-			login_manager.fail(_("Incorrect Verification code"), login_manager.user)
+			return False
 
 	totp = pyotp.TOTP(otp_secret)
 	if totp.verify(otp):
 		# show qr code only once
-		if not get_default(login_manager.user + "_otplogin"):
-			set_default(login_manager.user + "_otplogin", 1)
-			delete_qrimage(login_manager.user)
+		if not get_default(user + "_otplogin"):
+			set_default(user + "_otplogin", 1)
+			delete_qrimage(user)
 		tracker.add_success_attempt()
 		return True
 	else:
 		tracker.add_failure_attempt()
-		login_manager.fail(_("Incorrect Verification code"), login_manager.user)
+		return False
 
 
 def get_verification_obj(user, token, otp_secret):

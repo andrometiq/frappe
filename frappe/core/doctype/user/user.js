@@ -1,17 +1,55 @@
 frappe.ui.form.on("User", {
 	render_passkeys(frm) {
+		frm.passkey_request = (frm.passkey_request || 0) + 1;
 		frm.events.show_passkeys(frm, frm.doc.__onload?.passkeys || []);
+		if (
+			!frm.is_new() &&
+			frm.doc.name === frappe.session.user &&
+			typeof window.PublicKeyCredential?.signalAllAcceptedCredentials === "function"
+		) {
+			return frm.events.refresh_passkeys(frm).catch(() => {});
+		}
 	},
-	async refresh_passkeys(frm) {
+	async refresh_passkeys(frm, retired_handle) {
 		// Refresh only the list: reloading the form would discard unsaved User edits.
 		const doc = frm.doc;
-		const rows = await frappe.xcall(
+		const onload = doc.__onload;
+		const request = (frm.passkey_request || 0) + 1;
+		frm.passkey_request = request;
+		const data = await frappe.xcall(
 			"frappe.core.doctype.user_passkey.user_passkey.get_passkeys",
 			{ user: doc.name }
 		);
-		if (frm.doc !== doc) return;
-		(doc.__onload ||= {}).passkeys = rows;
-		frm.events.show_passkeys(frm, rows);
+		if (frm.doc !== doc || doc.__onload !== onload || frm.passkey_request !== request) return;
+		(doc.__onload ||= {}).passkeys = data.passkeys;
+		frm.events.show_passkeys(frm, data.passkeys);
+		if (
+			data.signal &&
+			retired_handle &&
+			!data.signal.handles.some((row) => row.user_handle === retired_handle)
+		) {
+			data.signal.handles.push({ user_handle: retired_handle, credential_ids: [] });
+		}
+		frm.events.signal_passkeys(frm, data.signal, request);
+	},
+	signal_passkeys(frm, signal, request = frm.passkey_request) {
+		const doc = frm.doc;
+		if (
+			doc.name !== frappe.session.user ||
+			signal?.name !== doc.name ||
+			!window.PublicKeyCredential
+		)
+			return;
+		const send = () => {
+			if (
+				frm.doc === doc &&
+				doc.name === frappe.session.user &&
+				frm.passkey_request === request
+			)
+				frappe.passkey.signal_credentials(signal);
+		};
+		if (frappe.passkey) send();
+		else frappe.require("passkey.bundle.js").then(send, () => {});
 	},
 	show_passkeys(frm, rows) {
 		const is_owner = frm.doc.name === frappe.session.user;
@@ -59,6 +97,7 @@ frappe.ui.form.on("User", {
 							default: row.label,
 						},
 						async ({ label }) => {
+							frm.passkey_request = (frm.passkey_request || 0) + 1;
 							await frappe.xcall(method + "rename_passkey", {
 								name: row.name,
 								label,
@@ -75,8 +114,14 @@ frappe.ui.form.on("User", {
 						frappe.utils.escape_html(row.label),
 					]),
 					async () => {
-						await frappe.xcall(method + "remove_passkey", { name: row.name });
-						await frm.events.refresh_passkeys(frm);
+						const doc = frm.doc;
+						const request = (frm.passkey_request || 0) + 1;
+						frm.passkey_request = request;
+						const result = await frappe.xcall(method + "remove_passkey", {
+							name: row.name,
+						});
+						if (frm.doc !== doc || frm.passkey_request !== request) return;
+						await frm.events.refresh_passkeys(frm, result.retired_handle);
 					}
 				)
 			);
@@ -84,9 +129,16 @@ frappe.ui.form.on("User", {
 		if (is_owner && frm.doc.__onload?.can_add_passkey && window.PublicKeyCredential) {
 			button(wrapper, __("Add a passkey"), async () => {
 				await frappe.require("passkey.bundle.js");
+				let is_awaiting_code = false;
 				const dialog = new frappe.ui.Dialog({
 					title: __("Add a passkey"),
 					fields: [
+						{
+							fieldname: "otp",
+							fieldtype: "Data",
+							label: __("Verification Code"),
+							hidden: 1,
+						},
 						{
 							fieldname: "password",
 							fieldtype: "Password",
@@ -101,19 +153,68 @@ frappe.ui.form.on("User", {
 						},
 					],
 					primary_action_label: __("Add a passkey"),
-					async primary_action({ password, label }) {
+					async primary_action({ password, label, otp }) {
+						frm.passkey_request = (frm.passkey_request || 0) + 1;
 						dialog.disable_primary_action();
 						try {
-							await frappe.passkey.register(password, label || __("Passkey"));
+							const result = await frappe.passkey.register(
+								password,
+								label || __("Passkey"),
+								otp
+							);
+							if (result.message.two_factor) {
+								is_awaiting_code = true;
+								const verification = result.message.two_factor;
+								const prompt =
+									verification.prompt ||
+									(verification.method === "OTP App"
+										? verification.setup
+											? __("Enter Code displayed in OTP App.")
+											: __(
+													"OTP setup using OTP App was not completed. Please contact Administrator."
+											  )
+										: verification.method === "SMS"
+										? __("SMS was not sent. Please contact Administrator.")
+										: __(
+												"Verification code email not sent. Please contact Administrator."
+										  ));
+								dialog.set_df_property(
+									"otp",
+									"description",
+									frappe.utils.escape_html(prompt)
+								);
+								dialog.set_df_property("otp", "hidden", 0);
+								dialog.set_df_property("otp", "reqd", 1);
+								dialog.get_primary_btn().text(__("Verify"));
+								dialog.fields_dict.otp.$input.trigger("focus");
+								return;
+							}
+							is_awaiting_code = false;
 							dialog.hide();
 							await frm.events.refresh_passkeys(frm);
 						} catch (error) {
-							if (error instanceof DOMException)
+							is_awaiting_code = false;
+							if (error?.name === "InvalidStateError") {
+								frappe.msgprint(
+									__("This device already has a passkey for your account.")
+								);
+							} else if (
+								typeof DOMException !== "undefined" &&
+								error instanceof DOMException &&
+								error.name !== "NotAllowedError"
+							) {
 								frappe.msgprint(
 									__("Couldn't add this passkey. Please try again.")
 								);
+							}
 						} finally {
-							dialog.set_value("password", "");
+							if (!is_awaiting_code) {
+								dialog.set_value("password", "");
+								dialog.set_value("otp", "");
+								dialog.set_df_property("otp", "hidden", 1);
+								dialog.set_df_property("otp", "reqd", 0);
+								dialog.get_primary_btn().text(__("Add a passkey"));
+							}
 							dialog.enable_primary_action();
 						}
 					},

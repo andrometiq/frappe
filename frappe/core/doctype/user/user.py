@@ -210,14 +210,14 @@ class User(Document):
 			self.name = self.email
 
 	def onload(self):
-		from frappe.core.doctype.user_passkey.user_passkey import get_passkeys, get_relying_party
+		from frappe.core.doctype.user_passkey.user_passkey import get_passkey_list, get_relying_party
 		from frappe.utils.modules import get_modules_from_all_apps
 
 		self.set_onload(
 			"can_add_passkey", bool(frappe.get_system_settings("login_with_passkey") and get_relying_party())
 		)
 		if self.name == frappe.session.user or frappe.has_permission("User Passkey", "delete"):
-			self.set_onload("passkeys", get_passkeys(self.name))
+			self.set_onload("passkeys", get_passkey_list(self.name))
 
 		self.set_onload("all_modules", sorted(m.get("module_name") for m in get_modules_from_all_apps()))
 
